@@ -19,6 +19,7 @@ package io.machinic.stream.test;
 import io.machinic.stream.FlatMapProducerFunction;
 import io.machinic.stream.MxStream;
 import io.machinic.stream.StreamException;
+import io.machinic.stream.StreamTimeoutException;
 import io.machinic.stream.test.utils.CountingSupplier;
 import io.machinic.stream.test.utils.IntegerGeneratorIterator;
 import org.junit.jupiter.api.Assertions;
@@ -33,6 +34,7 @@ import org.slf4j.LoggerFactory;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.stream.Stream;
@@ -266,6 +268,52 @@ public class MxStreamFlatMapTest {
 						})
 						.toList()
 		);
+	}
+	
+	@Test
+	public void asyncFlatMapTestThread() throws InterruptedException {
+		AtomicInteger current = new AtomicInteger(0);
+		AtomicInteger maxObserved = new AtomicInteger(0);
+		
+		MxStream.of(INTEGER_LIST_A)
+				.asyncFlatMap(2, 10, integer -> {
+					int inFlight = current.incrementAndGet();
+					maxObserved.updateAndGet(max -> Math.max(max, inFlight));
+					try {
+						Thread.sleep(50);
+					} catch (InterruptedException e) {
+						throw new RuntimeException(e);
+					}
+					current.decrementAndGet();
+					return Stream.of(integer);
+				})
+				.toList();
+		
+		Assertions.assertTrue(maxObserved.get() <= 2,
+				"Expected at most 2 concurrent tasks but observed " + maxObserved.get());
+	}
+	
+	@Test
+	public void asyncFlatMapTimeoutTest() {
+		// Task blocks until released; the 100 ms timeout fires long before we do.
+		CountDownLatch release = new CountDownLatch(1);
+		try {
+			StreamTimeoutException exception = Assertions.assertThrows(StreamTimeoutException.class, () ->
+					MxStream.of(INTEGER_LIST_A)
+							.asyncTimeoutMillis(100)
+							.asyncFlatMap(2, 10, integer -> {
+								try {
+									release.await();
+								} catch (InterruptedException e) {
+									Thread.currentThread().interrupt();
+								}
+								return Stream.of(integer);
+							})
+							.toList());
+			Assertions.assertEquals("asyncFlatMap task for element 1 did not complete within 100 ms", exception.getMessage());
+		} finally {
+			release.countDown(); // unblock any task thread still waiting
+		}
 	}
 	
 }

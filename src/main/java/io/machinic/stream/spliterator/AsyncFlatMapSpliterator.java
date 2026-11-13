@@ -20,6 +20,7 @@ import io.machinic.stream.FlatMapProducerFunction;
 import io.machinic.stream.MxStream;
 import io.machinic.stream.StreamException;
 import io.machinic.stream.StreamInterruptedException;
+import io.machinic.stream.StreamTimeoutException;
 import io.machinic.stream.concurrent.FlatMapFutureTask;
 import io.machinic.stream.metrics.AsyncMapMetric;
 import io.machinic.stream.metrics.AsyncMapMetricSupplier;
@@ -37,6 +38,18 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
+/**
+ * Spliterator implementation that performs asynchronous flat-map operations, executing the flat-map producer
+ * function on a separate thread pool while buffering results. Used internally by the MxStream library to
+ * implement the {@code asyncFlatMap} and {@code asyncFlatMapProducer} operations.
+ *
+ * <p>Each input element is submitted as an async task that produces zero or more output elements. Results are
+ * buffered in a bounded queue and consumed in order. The number of concurrent tasks is limited by the configured
+ * parallelism level.</p>
+ *
+ * @param <IN>  the type of elements consumed from the previous stage
+ * @param <OUT> the type of elements produced by this stage
+ */
 public class AsyncFlatMapSpliterator<IN, OUT> extends AbstractChainedSpliterator<IN, OUT> {
 	
 	private static final Logger logger = LoggerFactory.getLogger(AsyncFlatMapSpliterator.class);
@@ -52,10 +65,20 @@ public class AsyncFlatMapSpliterator<IN, OUT> extends AbstractChainedSpliterator
 	// This is only accessed by Spliterator thread, so it does not need to be thread safe
 	private final Queue<FlatMapFutureTask<IN, OUT>> queue;
 	private final ArrayBlockingQueue<Wrapper<OUT>> bufferQueue;
-	private final int desiredCapacity;
 	private final Consumer<OUT> advanceMapper;
 	private boolean started;
 	
+	/**
+	 * Creates a new async flat-map spliterator.
+	 * @param pipeline the pipeline this spliterator belongs to
+	 * @param previousSpliterator the spliterator from the previous stage
+	 * @param parallelism the maximum number of concurrent async tasks
+	 * @param bufferSize the buffer size for the async pipeline
+	 * @param asyncTimeoutMillis the timeout for async operations in milliseconds
+	 * @param executorService the executor for async tasks, or {@code null} for a virtual thread executor
+	 * @param metricSupplier a supplier of async metrics, or {@code null}
+	 * @param supplier the supplier of the flat-map producer function
+	 */
 	public AsyncFlatMapSpliterator(MxStream<IN> stream, MxSpliterator<IN> previousSpliterator, int parallelism, int bufferSize, long asyncTimeoutMillis, ExecutorService executorService, AsyncMapMetricSupplier metricSupplier,
 			Supplier<FlatMapProducerFunction<? super IN, ? extends OUT>> supplier) {
 		super(stream, previousSpliterator);
@@ -71,8 +94,6 @@ public class AsyncFlatMapSpliterator<IN, OUT> extends AbstractChainedSpliterator
 		this.queue = new ArrayDeque<>(parallelism + 2);
 		this.bufferQueue = new ArrayBlockingQueue<>(bufferSize);
 		
-		this.desiredCapacity = bufferSize / 4;
-		
 		this.advanceMapper = (value) -> {
 			try {
 				this.bufferQueue.put(new Wrapper<>(value));
@@ -83,6 +104,11 @@ public class AsyncFlatMapSpliterator<IN, OUT> extends AbstractChainedSpliterator
 		
 	}
 	
+	/**
+	 * Submits an async flat-map task to the executor and tracks it in the task queue.
+	 * @param task the flat-map future task to submit
+	 * @throws StreamException if the task cannot be enqueued
+	 */
 	private void enqueue(FlatMapFutureTask<IN, OUT> task) {
 		try {
 			this.executorService.submit(task);
@@ -98,75 +124,114 @@ public class AsyncFlatMapSpliterator<IN, OUT> extends AbstractChainedSpliterator
 		}
 	}
 	
+	/**
+	 * Dequeues buffered results and waits for the next completed task if necessary.
+	 * @param action the action to apply to each dequeued element
+	 * @param drain if {@code true}, drain all buffered results; otherwise only consume while the current task is not done
+	 * @throws StreamException if an error occurs while waiting for or processing the task
+	 */
 	private void dequeue(Consumer<? super OUT> action, boolean drain) throws StreamException {
 		FlatMapFutureTask<IN, OUT> futureTask = queue.peek();
+		if (futureTask == null) {
+			return;
+		}
 		
-		Wrapper<OUT> wrapper;
-		do {
-			wrapper = bufferQueue.poll();
-			if (wrapper != null) {
+		if (!(futureTask.isDone() || this.getQueueSize() >= parallelism || drain)) {
+			Wrapper<OUT> wrapper;
+			while ((wrapper = bufferQueue.poll()) != null) {
 				action.accept(wrapper.get());
 			}
-		} while (wrapper != null && (drain || (futureTask != null && !futureTask.isDone())));
+			return;
+		}
 		
-		if (futureTask != null) {
-			
-			if (futureTask.isDone()) {
-				try {
-					// Check and clear the interrupted status
-					if (Thread.interrupted()) {
-						throw new StreamInterruptedException("Stream has been interrupted");
+		try {
+			// Check and clear the interrupted status
+			if (Thread.interrupted()) {
+				throw new StreamInterruptedException("Stream has been interrupted");
+			}
+			long startTimestamp = System.nanoTime();
+			try {
+				long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(asyncTimeoutMillis);
+				boolean completed = false;
+				
+				while (!completed) {
+					long remainingNanos = deadline - System.nanoTime();
+					if (remainingNanos <= 0) {
+						break;
 					}
-					long startTimestamp = System.nanoTime();
-					try {
-						if (futureTask.await(this.asyncTimeoutMillis, TimeUnit.MILLISECONDS)) {
-							// Task is in a done state, we can safely dequeue the task
-							queue.poll();
-							if (futureTask.getException() != null) {
-								try {
-									getStream().exceptionHandler().onException(futureTask.getException(), futureTask.getInput());
-								} catch (StreamException e) {
-									throw e;
-								} catch (Exception e) {
-									throw new StreamException(String.format("asyncMap failed. Caused by %s", e.getMessage()), e);
-								}
-							}
-							
-							if (metric != null) {
-								metric.onEvent(futureTask.getPendingDuration(), futureTask.getDuration());
-							}
-						} else {
-							logger.warn("asyncFlatMap task timed out, cancelling task for {}", futureTask.getInput());
-							// Task will be canceled, we can safely dequeue the task
-							queue.poll();
-							futureTask.cancel(true);
-							getStream().exceptionHandler().onException(new StreamInterruptedException("asyncFlatMap has been interrupted"), futureTask.getInput());
+					
+					// Use a short poll timeout to interleave buffer consumption with task waiting,
+					// preventing deadlock when the task blocks on a full bufferQueue.
+					// A short timeout ensures we frequently check isDone() even when the buffer is empty.
+					long pollTimeout = Math.min(remainingNanos, 1_000_000L);
+					Wrapper<OUT> wrapper = bufferQueue.poll(pollTimeout, TimeUnit.NANOSECONDS);
+					if (wrapper != null) {
+						action.accept(wrapper.get());
+					}
+					
+					if (futureTask.isDone()) {
+						// Drain any remaining buffered results
+						Wrapper<OUT> remaining;
+						while ((remaining = bufferQueue.poll()) != null) {
+							action.accept(remaining.get());
 						}
-					} catch (InterruptedException e) {
-						throw new StreamInterruptedException("Stream has been interrupted");
-					} finally {
-						if (metric != null) {
-							long endTimestamp = System.nanoTime();
-							metric.onWait(endTimestamp - startTimestamp);
+						completed = true;
+					}
+				}
+				
+				if (completed) {
+					queue.poll();
+					if (futureTask.getException() != null) {
+						try {
+							getStream().exceptionHandler().onException(futureTask.getException(), futureTask.getInput());
+						} catch (StreamException e) {
+							throw e;
+						} catch (Exception e) {
+							throw new StreamException(String.format("asyncFlatMap failed. Caused by %s", e.getMessage()), e);
 						}
 					}
 					
-				} catch (StreamException e) {
-					while ((futureTask = queue.poll()) != null) {
-						futureTask.cancel(true);
+					if (metric != null) {
+						metric.onEvent(futureTask.getPendingDuration(), futureTask.getDuration());
 					}
-					throw e;
-				} catch (Exception e) {
-					throw new StreamException(String.format("asyncFlatMap failed. Caused by %s", e.getMessage()), e);
+				} else {
+					logger.warn("asyncFlatMap task timed out, cancelling task for {}", futureTask.getInput());
+					queue.poll();
+					futureTask.cancel(true);
+					getStream().exceptionHandler().onException(new StreamTimeoutException(String.format("asyncFlatMap task for element %s did not complete within %d ms", futureTask.getInput(), asyncTimeoutMillis)), futureTask.getInput());
+				}
+			} catch (InterruptedException e) {
+				throw new StreamInterruptedException("Stream has been interrupted");
+			} finally {
+				if (metric != null) {
+					long endTimestamp = System.nanoTime();
+					metric.onWait(endTimestamp - startTimestamp);
 				}
 			}
+			
+		} catch (StreamException e) {
+			while ((futureTask = queue.poll()) != null) {
+				futureTask.cancel(true);
+			}
+			throw e;
+		} catch (Exception e) {
+			throw new StreamException(String.format("asyncFlatMap failed. Caused by %s", e.getMessage()), e);
 		}
 	}
 	
+	/**
+	 * Returns the number of pending async tasks in the queue.
+	 * @return the queue size
+	 */
 	private int getQueueSize() {
 		return queue.size();
 	}
 	
+	/**
+	 * {@inheritDoc}
+	 * @param action the action to apply to each flattened element
+	 * @return {@code true} if an element was consumed
+	 */
 	@Override
 	public boolean tryAdvance(Consumer<? super OUT> action) {
 		if (!started && this.metric != null) {
@@ -174,14 +239,17 @@ public class AsyncFlatMapSpliterator<IN, OUT> extends AbstractChainedSpliterator
 			started = true;
 		}
 		
-		boolean canAdvance;
-		do {
+		boolean canAdvance = true;
+		while (this.getQueueSize() < parallelism) {
 			canAdvance = this.previousSpliterator.tryAdvance(value ->
 			{
 				this.enqueue(new FlatMapFutureTask<>(value, this.supplier.get(), this.advanceMapper));
 				this.dequeue(action, false);
 			});
-		} while (canAdvance && this.getQueueSize() <= parallelism);
+			if (!canAdvance) {
+				break;
+			}
+		}
 		
 		dequeue(action, false);
 		
@@ -194,13 +262,25 @@ public class AsyncFlatMapSpliterator<IN, OUT> extends AbstractChainedSpliterator
 		return canAdvance;
 	}
 	
+	/**
+	 * {@inheritDoc}
+	 * @param spliterator the portion of the previous spliterator
+	 * @return a new async flat-map spliterator for the split portion
+	 */
 	@Override
 	public AbstractChainedSpliterator<IN, OUT> split(MxSpliterator<IN> spliterator) {
-		return new AsyncFlatMapSpliterator<>(stream, spliterator, parallelism, bufferSize, asyncTimeoutMillis, this.providedExecutorService, metricSupplier, supplier);
+		return new AsyncFlatMapSpliterator<>(getStream(), spliterator, parallelism, bufferSize, asyncTimeoutMillis, this.providedExecutorService, metricSupplier, supplier);
 	}
 	
+	/**
+	 * {@inheritDoc}
+	 * Stops the async metric (if present), shuts down the executor service (if self-created), and cancels
+	 * all pending tasks.
+	 */
 	@Override
 	public void close() {
+		super.close();
+		
 		if (this.metric != null) {
 			this.metric.onStop();
 		}
