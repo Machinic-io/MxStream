@@ -27,7 +27,7 @@
 
     <name>MxStreams</name>
     <description>Enhanced Java 8 style streaming.</description>
-    <url>https://github.com/becoming-machinic/MxStream</url>
+    <url>https://github.com/Machinic-io/MxStream</url>
 
     <licenses>
         <license>
@@ -46,9 +46,9 @@
     </developers>
 
     <scm>
-        <connection>scm:git:git://github.com/becoming-machinic/MxStream.git</connection>
-        <developerConnection>scm:git:ssh://github.com:becoming-machinic/MxStream.git</developerConnection>
-        <url>https://github.com/becoming-machinic/MxStream/tree/main</url>
+        <connection>scm:git:git://github.com/Machinic-io/MxStream.git</connection>
+        <developerConnection>scm:git:ssh://github.com:Machinic-io/MxStream.git</developerConnection>
+        <url>https://github.com/Machinic-io/MxStream/tree/main</url>
     </scm>
 
     <properties>
