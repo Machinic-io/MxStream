@@ -70,7 +70,7 @@ public class AsyncFlatMapSpliterator<IN, OUT> extends AbstractChainedSpliterator
 	
 	/**
 	 * Creates a new async flat-map spliterator.
-	 * @param pipeline the pipeline this spliterator belongs to
+	 * @param stream the stream this spliterator belongs to
 	 * @param previousSpliterator the spliterator from the previous stage
 	 * @param parallelism the maximum number of concurrent async tasks
 	 * @param bufferSize the buffer size for the async pipeline
